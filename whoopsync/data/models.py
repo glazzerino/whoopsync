@@ -28,26 +28,6 @@ class User(Base):
     sleeps = relationship("Sleep", back_populates="user", cascade="all, delete-orphan")
     workouts = relationship("Workout", back_populates="user", cascade="all, delete-orphan")
     recoveries = relationship("Recovery", back_populates="user", cascade="all, delete-orphan")
-    tokens = relationship("UserToken", back_populates="user", uselist=False, cascade="all, delete-orphan")
-
-
-class UserToken(Base):
-    """User OAuth token model."""
-
-    __tablename__ = "user_tokens"
-
-    id = Column(Integer, primary_key=True)
-    user_id = Column(String, ForeignKey("users.user_id"), nullable=False, unique=True)
-    access_token = Column(String, nullable=False)
-    refresh_token = Column(String, nullable=False)
-    token_type = Column(String, nullable=False, default="Bearer")
-    expires_at = Column(DateTime, nullable=False)
-    scope = Column(String, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-    # Relationships
-    user = relationship("User", back_populates="tokens")
 
 
 class Cycle(Base):

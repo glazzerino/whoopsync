@@ -14,12 +14,7 @@ dependencies = [
     "python-dotenv",
     "pydantic",
     "sqlalchemy",
-    "pytest",
-    "jinja2",
-    "python-multipart",
-    "cryptography",
-    "click",
-    "aiosqlite"
+    "pytest"
 ]
 
 [tool.black]
