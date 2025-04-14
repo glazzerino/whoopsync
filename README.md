@@ -69,11 +69,26 @@ The daemon will run continuously, synchronizing data for all specified users at 
 
 ## Authentication
 
-Whoopsync requires OAuth tokens for each user you want to sync data for. In a production environment, you would need to set up OAuth authentication for each user. For development and testing, you can use:
+Whoopsync requires OAuth tokens for each user you want to sync data for. The package includes an OAuth2 server to handle the authentication flow:
 
-1. Register an application in the Whoop Developer Portal
-2. Follow the OAuth flow to get tokens for each user
-3. Store these tokens securely and provide them to Whoopsync
+1. Register an application in the [Whoop Developer Portal](https://developer.whoop.com)
+2. Set your client ID and secret in the configuration
+3. Run the API server to handle authentication:
+   ```bash
+   ./run_api_server.py --client-id=your_client_id --client-secret=your_client_secret
+   ```
+4. Direct users to `http://localhost:8000/api/auth/whoop` to start the OAuth flow
+5. After users authorize your app, their tokens will be stored in the database
+
+### Token Management
+
+Whoopsync includes a token refresh system to keep OAuth tokens valid:
+
+1. Run the token refresh script periodically (via cron or similar):
+   ```bash
+   ./refresh_tokens.py --client-id=your_client_id --client-secret=your_client_secret
+   ```
+2. This will automatically refresh any tokens that are about to expire
 
 ## Development
 

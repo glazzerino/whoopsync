@@ -7,6 +7,10 @@ from datetime import datetime, timedelta
 
 import httpx
 from pydantic import BaseModel
+from sqlalchemy.orm import Session
+
+from whoopsync.auth.token_manager import TokenManager
+from whoopsync.data.models import UserToken
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +31,8 @@ class WhoopAPI:
         self,
         client_id: str,
         client_secret: str,
-        user_tokens: Dict[str, str],
+        token_manager: Optional[TokenManager] = None,
+        user_tokens: Optional[Dict[str, str]] = None,
         max_retries: int = 3,
         retry_delay: int = 2,
     ):
@@ -36,13 +41,15 @@ class WhoopAPI:
         Args:
             client_id: Whoop API client ID
             client_secret: Whoop API client secret
-            user_tokens: Dict of user IDs to their OAuth tokens
+            token_manager: TokenManager instance for token management
+            user_tokens: Dict of user IDs to their OAuth tokens (legacy mode)
             max_retries: Maximum number of retries on failure
             retry_delay: Delay between retries in seconds
         """
         self.client_id = client_id
         self.client_secret = client_secret
-        self.user_tokens = user_tokens
+        self.token_manager = token_manager
+        self.user_tokens = user_tokens or {}
         self.max_retries = max_retries
         self.retry_delay = retry_delay
         self.client = httpx.AsyncClient(timeout=30.0)
@@ -52,7 +59,8 @@ class WhoopAPI:
         await self.client.aclose()
 
     async def _make_request(
-        self, method: str, path: str, user_id: str, params: Optional[Dict[str, Any]] = None
+        self, method: str, path: str, user_id: str, params: Optional[Dict[str, Any]] = None,
+        db_session: Optional[Session] = None
     ) -> Dict[str, Any]:
         """Make a request to the Whoop API with retry logic.
 
@@ -61,6 +69,7 @@ class WhoopAPI:
             path: API path
             user_id: User ID for authentication
             params: Query parameters
+            db_session: Database session for token management
 
         Returns:
             Response JSON
@@ -68,11 +77,21 @@ class WhoopAPI:
         Raises:
             WhoopAPIError: If the request fails after retries
         """
-        if user_id not in self.user_tokens:
-            raise WhoopAPIError(f"No token found for user {user_id}")
+        # Get access token
+        access_token = None
+        
+        # First try token manager if available
+        if self.token_manager and db_session:
+            access_token = await self.token_manager.get_valid_token(db_session, user_id)
+        # Fall back to legacy token dictionary
+        elif user_id in self.user_tokens:
+            access_token = self.user_tokens[user_id]
+            
+        if not access_token:
+            raise WhoopAPIError(f"No valid token found for user {user_id}")
 
         url = f"{self.BASE_URL}{path}"
-        headers = {"Authorization": f"Bearer {self.user_tokens[user_id]}"}
+        headers = {"Authorization": f"Bearer {access_token}"}
 
         for attempt in range(self.max_retries):
             try:
@@ -90,9 +109,36 @@ class WhoopAPI:
                 if response.status_code == 401:
                     # Token might be expired, try to refresh
                     logger.warning(f"Authentication error for user {user_id}, token might be expired")
-                    # In a real implementation, this would refresh the token
-                    # For now, we'll just raise the error
-                    raise WhoopAPIError(f"Authentication failed for user {user_id}")
+                    
+                    if self.token_manager and db_session:
+                        try:
+                            # Get token again 
+                            token = db_session.query(UserToken).filter_by(user_id=user_id).first()
+                            if not token:
+                                raise WhoopAPIError(f"No token found for user {user_id}")
+                                
+                            # Refresh token
+                            refreshed_token = await self.token_manager.refresh_token(
+                                db_session, user_id, token.refresh_token
+                            )
+                            
+                            if not refreshed_token:
+                                raise WhoopAPIError(f"Failed to refresh token for user {user_id}")
+                                
+                            # Try request again with new token
+                            headers = {"Authorization": f"Bearer {refreshed_token.access_token}"}
+                            response = await self.client.request(
+                                method=method, url=url, headers=headers, params=params
+                            )
+                            
+                            if response.status_code == 200:
+                                return response.json()
+                        except Exception as e:
+                            logger.error(f"Error refreshing token: {e}")
+                            raise WhoopAPIError(f"Authentication failed for user {user_id}") from e
+                    else:
+                        # No token manager or DB session available
+                        raise WhoopAPIError(f"Authentication failed for user {user_id}")
                 
                 response.raise_for_status()
                 return response.json()
@@ -110,7 +156,8 @@ class WhoopAPI:
         raise WhoopAPIError("Maximum retries exceeded")
 
     async def get_cycles(
-        self, user_id: str, start_time: Optional[datetime] = None, end_time: Optional[datetime] = None
+        self, user_id: str, start_time: Optional[datetime] = None, end_time: Optional[datetime] = None,
+        db_session: Optional[Session] = None
     ) -> List[Dict[str, Any]]:
         """Get cycles for a user.
 
@@ -118,6 +165,7 @@ class WhoopAPI:
             user_id: User ID
             start_time: Start time to fetch data from
             end_time: End time to fetch data to
+            db_session: Database session for token management
 
         Returns:
             List of cycles data
@@ -135,7 +183,7 @@ class WhoopAPI:
             if next_token:
                 params["nextToken"] = next_token
 
-            response = await self._make_request("GET", "/v1/cycle", user_id, params)
+            response = await self._make_request("GET", "/v1/cycle", user_id, params, db_session)
             
             # Add records to our collection
             all_records.extend(response.get("records", []))
@@ -148,7 +196,8 @@ class WhoopAPI:
         return all_records
 
     async def get_sleep(
-        self, user_id: str, start_time: Optional[datetime] = None, end_time: Optional[datetime] = None
+        self, user_id: str, start_time: Optional[datetime] = None, end_time: Optional[datetime] = None,
+        db_session: Optional[Session] = None
     ) -> List[Dict[str, Any]]:
         """Get sleep data for a user.
 
@@ -156,6 +205,7 @@ class WhoopAPI:
             user_id: User ID
             start_time: Start time to fetch data from
             end_time: End time to fetch data to
+            db_session: Database session for token management
 
         Returns:
             List of sleep data
@@ -173,7 +223,7 @@ class WhoopAPI:
             if next_token:
                 params["nextToken"] = next_token
 
-            response = await self._make_request("GET", "/v1/activity/sleep", user_id, params)
+            response = await self._make_request("GET", "/v1/activity/sleep", user_id, params, db_session)
             
             # Add records to our collection
             all_records.extend(response.get("records", []))
@@ -186,7 +236,8 @@ class WhoopAPI:
         return all_records
 
     async def get_workouts(
-        self, user_id: str, start_time: Optional[datetime] = None, end_time: Optional[datetime] = None
+        self, user_id: str, start_time: Optional[datetime] = None, end_time: Optional[datetime] = None,
+        db_session: Optional[Session] = None
     ) -> List[Dict[str, Any]]:
         """Get workout data for a user.
 
@@ -211,7 +262,7 @@ class WhoopAPI:
             if next_token:
                 params["nextToken"] = next_token
 
-            response = await self._make_request("GET", "/v1/activity/workout", user_id, params)
+            response = await self._make_request("GET", "/v1/activity/workout", user_id, params, db_session)
             
             # Add records to our collection
             all_records.extend(response.get("records", []))
@@ -224,7 +275,8 @@ class WhoopAPI:
         return all_records
 
     async def get_recoveries(
-        self, user_id: str, start_time: Optional[datetime] = None, end_time: Optional[datetime] = None
+        self, user_id: str, start_time: Optional[datetime] = None, end_time: Optional[datetime] = None,
+        db_session: Optional[Session] = None
     ) -> List[Dict[str, Any]]:
         """Get recovery data for a user.
 
@@ -249,7 +301,7 @@ class WhoopAPI:
             if next_token:
                 params["nextToken"] = next_token
 
-            response = await self._make_request("GET", "/v1/recovery", user_id, params)
+            response = await self._make_request("GET", "/v1/recovery", user_id, params, db_session)
             
             # Add records to our collection
             all_records.extend(response.get("records", []))
@@ -261,7 +313,7 @@ class WhoopAPI:
 
         return all_records
 
-    async def get_user_profile(self, user_id: str) -> Dict[str, Any]:
+    async def get_user_profile(self, user_id: str, db_session: Optional[Session] = None) -> Dict[str, Any]:
         """Get user profile data.
 
         Args:
@@ -270,4 +322,4 @@ class WhoopAPI:
         Returns:
             User profile data
         """
-        return await self._make_request("GET", "/v1/user/profile/basic", user_id)
+        return await self._make_request("GET", "/v1/user/profile/basic", user_id, db_session=db_session)
