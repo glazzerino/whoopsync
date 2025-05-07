@@ -37,7 +37,7 @@ from dotenv import dotenv_values
 env_values = dotenv_values(env_path)
 
 CLIENT_ID = env_values.get("WHOOP_CLIENT_ID")
-CLIENT_SECRET = env_values.get("WHOOP_CLIENT_SECRET") 
+CLIENT_SECRET = env_values.get("WHOOP_CLIENT_SECRET")
 REDIRECT_URI = env_values.get("WHOOP_REDIRECT_URI")
 AUTH_DATABASE_URL = env_values.get("AUTH_DATABASE_URL", "sqlite:///auth.db")
 MAIN_DATABASE_URL = env_values.get("MAIN_DATABASE_URL", "sqlite:///whoop.db")
@@ -58,18 +58,16 @@ data_manager.initialize_database()
 # Templates directory for serving the HTML
 templates = Jinja2Templates(directory="whoopsync/frontend")
 
-# Mount static files
-app.mount("/static", StaticFiles(directory="whoopsync/frontend/static"), name="static")
 
 
 @app.on_event("startup")
 async def startup_event():
     """Initialize the application on startup."""
     global CLIENT_ID, CLIENT_SECRET, REDIRECT_URI
-    
+
     logger.info("Starting Whoop OAuth server")
     logger.info(f"Environment variables: CLIENT_ID={CLIENT_ID}, CLIENT_SECRET={'*****' if CLIENT_SECRET else 'None'}, REDIRECT_URI={REDIRECT_URI}")
-    
+
     if not CLIENT_ID or not CLIENT_SECRET or not REDIRECT_URI:
         logger.error("Missing required environment variables")
         # For development purposes, use dummy values
@@ -91,17 +89,17 @@ async def auth_whoop(response: Response):
     """Redirect to Whoop OAuth authorization page."""
     # Define the required scopes
     scopes = [
-        "read:recovery", 
-        "read:cycles", 
-        "read:workout", 
-        "read:sleep", 
-        "read:profile", 
+        "read:recovery",
+        "read:cycles",
+        "read:workout",
+        "read:sleep",
+        "read:profile",
         "read:body_measurement"
     ]
-    
+
     # Generate a secure random state string to prevent CSRF attacks
     state = secrets.token_urlsafe(32)
-    
+
     # Set the state in a secure HTTP-only cookie (expires in 10 minutes)
     response.set_cookie(
         key="oauth_state",
@@ -111,7 +109,7 @@ async def auth_whoop(response: Response):
         samesite="lax",
         max_age=600  # 10 minutes in seconds
     )
-    
+
     # Prepare the authorization URL
     params = {
         "client_id": CLIENT_ID,
@@ -120,7 +118,7 @@ async def auth_whoop(response: Response):
         "scope": " ".join(scopes),
         "state": state
     }
-    
+
     auth_url = f"https://api.prod.whoop.com/oauth/oauth2/auth?{urlencode(params)}"
     return RedirectResponse(auth_url)
 
@@ -128,8 +126,8 @@ async def auth_whoop(response: Response):
 @app.get("/api/auth/callback")
 async def auth_callback(
     request: Request,
-    code: str, 
-    state: Optional[str] = None, 
+    code: str,
+    state: Optional[str] = None,
     oauth_state: Optional[str] = Cookie(None)
 ):
     """Handle the OAuth callback from Whoop."""
@@ -137,10 +135,10 @@ async def auth_callback(
     if not state or not oauth_state or state != oauth_state:
         logger.error("State verification failed")
         raise HTTPException(
-            status_code=400, 
+            status_code=400,
             detail="Invalid state parameter. Authorization request may have been tampered with."
         )
-    
+
     # Exchange the authorization code for an access token
     token_url = "https://api.prod.whoop.com/oauth/oauth2/token"
     payload = {
@@ -150,26 +148,26 @@ async def auth_callback(
         "grant_type": "authorization_code",
         "redirect_uri": REDIRECT_URI
     }
-    
+
     async with httpx.AsyncClient() as client:
         try:
             response = await client.post(token_url, data=payload)
             response.raise_for_status()
             token_data = response.json()
-            
+
             # Get user profile to extract user ID
             headers = {"Authorization": f"Bearer {token_data['access_token']}"}
             profile_response = await client.get(
-                "https://api.prod.whoop.com/developer/v1/user/profile/basic", 
+                "https://api.prod.whoop.com/developer/v1/user/profile/basic",
                 headers=headers
             )
             profile_response.raise_for_status()
             profile_data = profile_response.json()
-            
+
             user_id = str(profile_data.get("user_id"))
             if not user_id:
                 raise HTTPException(status_code=400, detail="Failed to retrieve user ID")
-                
+
             # Store token in the database
             with auth_manager.get_session() as session:
                 auth_manager.store_token(
@@ -181,7 +179,7 @@ async def auth_callback(
                     token_type=token_data["token_type"],
                     scopes=token_data.get("scope", "")
                 )
-                
+
             # Store user profile in the main database
             with data_manager.get_session() as session:
                 data_manager.create_or_update_user(
@@ -189,12 +187,12 @@ async def auth_callback(
                     user_id=user_id,
                     user_data=profile_data
                 )
-                
+
             # Redirect to success page with cleared oauth_state cookie
             response = RedirectResponse("/api/auth/success")
             response.delete_cookie(key="oauth_state")
             return response
-            
+
         except httpx.HTTPError as e:
             logger.error(f"Error exchanging authorization code: {e}")
             raise HTTPException(status_code=500, detail="Failed to exchange authorization code")
@@ -213,21 +211,21 @@ async def revoke_token(user_id: str):
         token = auth_manager.get_token(session, user_id)
         if not token:
             raise HTTPException(status_code=404, detail="Token not found")
-            
+
         # Call Whoop API to revoke the token
         async with httpx.AsyncClient() as client:
             try:
                 headers = {"Authorization": f"Bearer {token.access_token}"}
                 response = await client.delete(
-                    "https://api.prod.whoop.com/developer/v1/user/access", 
+                    "https://api.prod.whoop.com/developer/v1/user/access",
                     headers=headers
                 )
                 response.raise_for_status()
-                
+
                 # Deactivate token in the database
                 auth_manager.deactivate_token(session, user_id)
                 return {"status": "success", "message": "Token revoked successfully"}
-                
+
             except httpx.HTTPError as e:
                 logger.error(f"Error revoking token: {e}")
                 # Even if the API call fails, deactivate the token locally
