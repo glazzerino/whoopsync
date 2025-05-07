@@ -6,10 +6,12 @@ import logging
 import pathlib
 import secrets
 import hashlib
-from typing import Dict, Optional, Any, Tuple
+import time
+from typing import Dict, Optional, Any, Tuple, List
 from datetime import datetime, timedelta
 from urllib.parse import urlencode
 from dotenv import load_dotenv
+import threading
 
 from fastapi import FastAPI, Request, Response, HTTPException, Depends, Cookie
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -58,6 +60,77 @@ data_manager.initialize_database()
 # Templates directory for serving the HTML
 templates = Jinja2Templates(directory="whoopsync/frontend")
 
+# OAuth state management
+class OAuthStateStore:
+    """Store for managing OAuth state tokens with automatic expiration."""
+    
+    def __init__(self, expiry_seconds: int = 600):
+        """Initialize the state store.
+        
+        Args:
+            expiry_seconds: How long states should be valid for (default: 10 minutes)
+        """
+        self.states: Dict[str, float] = {}  # state -> timestamp mapping
+        self.expiry_seconds = expiry_seconds
+        self.lock = threading.RLock()  # Reentrant lock for thread safety
+        
+        # Start background cleanup thread
+        self.cleanup_thread = threading.Thread(target=self._cleanup_loop, daemon=True)
+        self.cleanup_thread.start()
+    
+    def generate_state(self) -> str:
+        """Generate a new state token and store it.
+        
+        Returns:
+            The generated state token
+        """
+        state = secrets.token_urlsafe(32)
+        with self.lock:
+            self.states[state] = time.time()
+        return state
+    
+    def validate_state(self, state: str) -> bool:
+        """Validate a state token and remove it from the store if valid.
+        
+        Args:
+            state: The state token to validate
+            
+        Returns:
+            True if the state is valid, False otherwise
+        """
+        with self.lock:
+            if state not in self.states:
+                return False
+                
+            timestamp = self.states[state]
+            if time.time() - timestamp > self.expiry_seconds:
+                # State has expired
+                del self.states[state]
+                return False
+                
+            # State is valid, remove it (one-time use)
+            del self.states[state]
+            return True
+    
+    def _cleanup_expired(self) -> None:
+        """Remove expired states from the store."""
+        current_time = time.time()
+        with self.lock:
+            expired_states = [
+                state for state, timestamp in self.states.items()
+                if current_time - timestamp > self.expiry_seconds
+            ]
+            for state in expired_states:
+                del self.states[state]
+    
+    def _cleanup_loop(self) -> None:
+        """Background thread that periodically cleans up expired states."""
+        while True:
+            time.sleep(60)  # Run cleanup every minute
+            self._cleanup_expired()
+
+# Initialize the state store
+oauth_state_store = OAuthStateStore()
 
 
 @app.on_event("startup")
@@ -85,7 +158,7 @@ async def home(request: Request):
 
 
 @app.get("/api/auth/whoop")
-async def auth_whoop(response: Response):
+async def auth_whoop():
     """Redirect to Whoop OAuth authorization page."""
     # Define the required scopes
     scopes = [
@@ -97,18 +170,9 @@ async def auth_whoop(response: Response):
         "read:body_measurement"
     ]
 
-    # Generate a secure random state string to prevent CSRF attacks
-    state = secrets.token_urlsafe(32)
-
-    # Set the state in a secure HTTP-only cookie (expires in 10 minutes)
-    response.set_cookie(
-        key="oauth_state",
-        value=state,
-        httponly=True,
-        secure=True,  # Requires HTTPS
-        samesite="lax",
-        max_age=600  # 10 minutes in seconds
-    )
+    # Generate a secure random state string and store it server-side
+    state = oauth_state_store.generate_state()
+    logger.info(f"Generated new OAuth state: {state[:8]}...")
 
     # Prepare the authorization URL
     params = {
@@ -127,16 +191,15 @@ async def auth_whoop(response: Response):
 async def auth_callback(
     request: Request,
     code: str,
-    state: Optional[str] = None,
-    oauth_state: Optional[str] = Cookie(None)
+    state: Optional[str] = None
 ):
     """Handle the OAuth callback from Whoop."""
     # Verify state parameter to prevent CSRF attacks
-    if not state or not oauth_state or state != oauth_state:
-        logger.error("State verification failed")
+    if not state or not oauth_state_store.validate_state(state):
+        logger.error(f"State verification failed for state: {state[:8] if state else 'None'}")
         raise HTTPException(
             status_code=400,
-            detail="Invalid state parameter. Authorization request may have been tampered with."
+            detail="Invalid state parameter. Authorization request may have been tampered with or expired."
         )
 
     # Exchange the authorization code for an access token
@@ -188,10 +251,8 @@ async def auth_callback(
                     user_data=profile_data
                 )
 
-            # Redirect to success page with cleared oauth_state cookie
-            response = RedirectResponse("/api/auth/success")
-            response.delete_cookie(key="oauth_state")
-            return response
+            # Redirect to success page
+            return RedirectResponse("/api/auth/success")
 
         except httpx.HTTPError as e:
             logger.error(f"Error exchanging authorization code: {e}")
