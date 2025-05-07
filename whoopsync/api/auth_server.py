@@ -167,12 +167,12 @@ async def auth_whoop():
         "read:workout",
         "read:sleep",
         "read:profile",
-        "read:body_measurement"
+        "read:body_measurement",
+        "offline"  # This scope is required to get a refresh token
     ]
 
     # Generate a secure random state string and store it server-side
     state = oauth_state_store.generate_state()
-    logger.info(f"Generated new OAuth state: {state[:8]}...")
 
     # Prepare the authorization URL
     params = {
