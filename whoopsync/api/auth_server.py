@@ -4,12 +4,14 @@ import os
 import json
 import logging
 import pathlib
+import secrets
+import hashlib
 from typing import Dict, Optional, Any, Tuple
 from datetime import datetime, timedelta
 from urllib.parse import urlencode
 from dotenv import load_dotenv
 
-from fastapi import FastAPI, Request, Response, HTTPException, Depends
+from fastapi import FastAPI, Request, Response, HTTPException, Depends, Cookie
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -85,7 +87,7 @@ async def home(request: Request):
 
 
 @app.get("/api/auth/whoop")
-async def auth_whoop():
+async def auth_whoop(response: Response):
     """Redirect to Whoop OAuth authorization page."""
     # Define the required scopes
     scopes = [
@@ -97,12 +99,26 @@ async def auth_whoop():
         "read:body_measurement"
     ]
     
+    # Generate a secure random state string to prevent CSRF attacks
+    state = secrets.token_urlsafe(32)
+    
+    # Set the state in a secure HTTP-only cookie (expires in 10 minutes)
+    response.set_cookie(
+        key="oauth_state",
+        value=state,
+        httponly=True,
+        secure=True,  # Requires HTTPS
+        samesite="lax",
+        max_age=600  # 10 minutes in seconds
+    )
+    
     # Prepare the authorization URL
     params = {
         "client_id": CLIENT_ID,
         "redirect_uri": REDIRECT_URI,
         "response_type": "code",
-        "scope": " ".join(scopes)
+        "scope": " ".join(scopes),
+        "state": state
     }
     
     auth_url = f"https://api.prod.whoop.com/oauth/oauth2/auth?{urlencode(params)}"
@@ -110,8 +126,21 @@ async def auth_whoop():
 
 
 @app.get("/api/auth/callback")
-async def auth_callback(code: str, state: Optional[str] = None):
+async def auth_callback(
+    request: Request,
+    code: str, 
+    state: Optional[str] = None, 
+    oauth_state: Optional[str] = Cookie(None)
+):
     """Handle the OAuth callback from Whoop."""
+    # Verify state parameter to prevent CSRF attacks
+    if not state or not oauth_state or state != oauth_state:
+        logger.error("State verification failed")
+        raise HTTPException(
+            status_code=400, 
+            detail="Invalid state parameter. Authorization request may have been tampered with."
+        )
+    
     # Exchange the authorization code for an access token
     token_url = "https://api.prod.whoop.com/oauth/oauth2/token"
     payload = {
@@ -161,8 +190,10 @@ async def auth_callback(code: str, state: Optional[str] = None):
                     user_data=profile_data
                 )
                 
-            # Redirect to success page
-            return RedirectResponse("/api/auth/success")
+            # Redirect to success page with cleared oauth_state cookie
+            response = RedirectResponse("/api/auth/success")
+            response.delete_cookie(key="oauth_state")
+            return response
             
         except httpx.HTTPError as e:
             logger.error(f"Error exchanging authorization code: {e}")
